@@ -1,0 +1,25 @@
+{
+  "delivery_deadline": "2025-04-10",
+  "request_date": "2025-01-01",
+  "items": [
+    {
+      "item_name": "Standard copy paper",
+      "quantity": 10,
+      "unit_price": 0.04,
+      "total_price": 0.4
+    },
+    {
+      "item_name": "Cardstock",
+      "quantity": 5,
+      "unit_price": 0.15,
+      "total_price": 0.75
+    },
+    {
+      "item_name": "Colored paper",
+      "quantity": 3,
+      "unit_price": 0.1,
+      "total_price": 0.30000000000000004
+    }
+  ],
+  "total_amount": 1.45
+}

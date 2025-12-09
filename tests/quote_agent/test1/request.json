@@ -1,0 +1,18 @@
+{
+  "delivery_deadline": "2025-04-15",
+  "request_date": "2025-01-01",
+  "items": [
+    {
+      "item_name": "A4 paper",
+      "quantity": 500
+    },
+    {
+      "item_name": "Letter-sized paper",
+      "quantity": 300
+    },
+    {
+      "item_name": "Cardstock",
+      "quantity": 200
+    }
+  ]
+}

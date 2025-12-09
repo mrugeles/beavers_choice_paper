@@ -1,0 +1,25 @@
+{
+  "delivery_deadline": "2025-04-15",
+  "request_date": "2025-01-01",
+  "items": [
+    {
+      "item_name": "Cardstock",
+      "quantity": 500,
+      "unit_price": 0.15,
+      "total_price": 75.0
+    },
+    {
+      "item_name": "Standard copy paper",
+      "quantity": 200,
+      "unit_price": 0.04,
+      "total_price": 8.0
+    },
+    {
+      "item_name": "Flyers",
+      "quantity": 1000,
+      "unit_price": 0.15,
+      "total_price": 150.0
+    }
+  ],
+  "total_amount": 233.0
+}
