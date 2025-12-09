@@ -8,7 +8,7 @@ import dotenv
 import ast
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
-from typing import Dict, List, Union, Literal
+from typing import Dict, List, Union,Literal
 
 from sqlalchemy import create_engine, Engine
 from smolagents import ToolCallingAgent, OpenAIServerModel, tool
@@ -715,105 +715,7 @@ def get_item_unit_price(item_name: str) -> float:
 # Tools for quoting agent
 VALID_ITEMS_LIST = ','.join([item_supply["item_name"] for item_supply in paper_supplies])
 
-@tool
-def structure_request(request_text: str) -> Dict:
-    """
-        Uses a language model to convert a raw quote request into a structured JSON object.
 
-        Args:
-            request_text: The raw text from a client's request.
-
-        Returns:
-            A dictionary representing the structured request.
-        """
-    # 2. Create a detailed prompt for the model
-
-    prompt = f"""
-        **Context:** You are an expert data extraction agent. Your task is to analyze a client request and extract 
-        the delivery deadline and a list of items into a structured JSON object. You must strictly adhere to the 
-        provided schema, rules, and item list.
-
-        ### **1. JSON Output Schema**
-
-        The final JSON object must follow this exact structure.
-
-        ```json
-        {{
-          "delivery_deadline": "string (YYYY-MM-DD)",
-          "request_date": "string (YYYY-MM-DD)",
-          "items": [
-            {{
-              "item_name": "string",
-              "quantity": "integer"
-            }}
-          ]
-        }}
-        ```
-
-        ### **2. Rules and Constraints**
-
-          * **Item Mapping:** For each item mentioned in the client's request, find the most semantically similar name from the `VALID_ITEMS_LIST` and use it for the `item_name` field.
-          * **Date Formatting:** The `delivery_deadline` in the output must be in `YYYY-MM-DD` format.
-          * **Missing Information:** If any field's information is not present in the request text, use `null` as its value in the JSON output.
-
-        ### **3. Example**
-
-        Here is an example of how to process a request correctly.
-
-          * **VALID_ITEMS_LIST:** `["Corporate Banner", "Step-and-Repeat Backdrop", "Podium Sign", "Tablecloth", "Retractable Banner Stand"]`
-
-          * **REQUEST_TEXT:**
-
-            > "Hey team, we've got the annual TechGala coming up. It's a pretty big job. Order date is Oct 28, 2024. We'll need everything delivered by Nov 1, 2024. We need 3 of those big vinyl things with our logos all over it for the red carpet, and a branded cloth for the main table. Also, add 5 of those roll-up signs for the hallways."
-
-          * **CORRECT JSON OUTPUT:**
-
-            ```json
-            {{
-              "delivery_deadline": "2024-11-01",
-              "request_date": "2024-10-01",
-              "items": [
-                {{
-                  "item_name": "Step-and-Repeat Backdrop",
-                  "quantity": 3
-                }},
-                {{
-                  "item_name": "Tablecloth",
-                  "quantity": 1
-                }},
-                {{
-                  "item_name": "Retractable Banner Stand",
-                  "quantity": 5
-                }}
-              ]
-            }}
-            ```
-
-        ### **4. Your Task**
-
-        Now, process the following client request.
-
-          * **VALID_ITEMS_LIST:** **{VALID_ITEMS_LIST}**
-          * **REQUEST_TEXT:**
-            > 
-            > -----
-            > ## **{request_text}**
-
-        Generate the JSON object:
-        """
-
-    # 3. Call the model and get the response
-    messages = [{"role": "user", "content": prompt}]
-    response = model(messages)
-
-    # 4. Clean up the response and parse the JSON
-    try:
-        # The model may return the JSON wrapped in markdown
-        cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
-        return json.loads(cleaned_response)
-    except json.JSONDecodeError:
-        print("Error: The model did not return valid JSON.")
-        return None
 
 
 #
@@ -979,7 +881,7 @@ import dotenv
 import ast
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
-from typing import Dict, List, Union, Literal
+from typing import Dict, List, Union
 
 from sqlalchemy import create_engine, Engine
 from smolagents import ToolCallingAgent, OpenAIServerModel, tool
@@ -1508,65 +1410,6 @@ def generate_financial_report(as_of_date: Union[str, datetime]) -> Dict:
     }
 
 
-def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
-    """
-    Retrieve a list of historical quotes that match any of the provided search terms.
-
-    The function searches both the original customer request (from `quote_requests`) and
-    the explanation for the quote (from `quotes`) for each keyword. Results are sorted by
-    most recent order date and limited by the `limit` parameter.
-
-    Args:
-        search_terms (List[str]): List of terms to match against customer requests and explanations.
-        limit (int, optional): Maximum number of quote records to return. Default is 5.
-
-    Returns:
-        List[Dict]: A list of matching quotes, each represented as a dictionary with fields:
-            - original_request
-            - total_amount
-            - quote_explanation
-            - job_type
-            - order_size
-            - event_type
-            - order_date
-    """
-    conditions = []
-    params = {}
-    print(f"DEBUG: Searching quotes with terms: {search_terms} and limit: {limit}")
-    # Build SQL WHERE clause using LIKE filters for each search term
-    for i, term in enumerate(search_terms):
-        param_name = f"term_{i}"
-        conditions.append(
-            f"(LOWER(qr.response) LIKE :{param_name} OR "
-            f"LOWER(q.quote_explanation) LIKE :{param_name})"
-        )
-        params[param_name] = f"%{term.lower()}%"
-
-    # Combine conditions; fallback to always-true if no terms provided
-    where_clause = " AND ".join(conditions) if conditions else "1=1"
-
-    # Final SQL query to join quotes with quote_requests
-    query = f"""
-        SELECT
-            qr.response AS original_request,
-            q.total_amount,
-            q.quote_explanation,
-            q.job_type,
-            q.order_size,
-            q.event_type,
-            q.order_date
-        FROM quotes q
-        JOIN quote_requests qr ON q.request_id = qr.id
-        WHERE {where_clause}
-        ORDER BY q.order_date DESC
-        LIMIT {limit}
-    """
-
-    # Execute parameterized query
-    with db_engine.connect() as conn:
-        result = conn.execute(text(query), params)
-        return [row._asdict() for row in result]
-
 ########################
 ########################
 ########################
@@ -1688,105 +1531,6 @@ def get_item_unit_price(item_name: str) -> float:
 # Tools for quoting agent
 VALID_ITEMS_LIST = ','.join([item_supply["item_name"] for item_supply in paper_supplies])
 
-@tool
-def structure_request(request_text: str) -> Dict:
-    """
-        Uses a language model to convert a raw quote request into a structured JSON object.
-
-        Args:
-            request_text: The raw text from a client's request.
-
-        Returns:
-            A dictionary representing the structured request.
-        """
-    # 2. Create a detailed prompt for the model
-
-    prompt = f"""
-        **Context:** You are an expert data extraction agent. Your task is to analyze a client request and extract 
-        the delivery deadline and a list of items into a structured JSON object. You must strictly adhere to the 
-        provided schema, rules, and item list.
-
-        ### **1. JSON Output Schema**
-
-        The final JSON object must follow this exact structure.
-
-        ```json
-        {{
-          "delivery_deadline": "string (YYYY-MM-DD)",
-          "request_date": "string (YYYY-MM-DD)",
-          "items": [
-            {{
-              "item_name": "string",
-              "quantity": "integer"
-            }}
-          ]
-        }}
-        ```
-
-        ### **2. Rules and Constraints**
-
-          * **Item Mapping:** For each item mentioned in the client's request, find the most semantically similar name from the `VALID_ITEMS_LIST` and use it for the `item_name` field.
-          * **Date Formatting:** The `delivery_deadline` in the output must be in `YYYY-MM-DD` format.
-          * **Missing Information:** If any field's information is not present in the request text, use `null` as its value in the JSON output.
-
-        ### **3. Example**
-
-        Here is an example of how to process a request correctly.
-
-          * **VALID_ITEMS_LIST:** `["Corporate Banner", "Step-and-Repeat Backdrop", "Podium Sign", "Tablecloth", "Retractable Banner Stand"]`
-
-          * **REQUEST_TEXT:**
-
-            > "Hey team, we've got the annual TechGala coming up. It's a pretty big job. Order date is Oct 28, 2024. We'll need everything delivered by Nov 1, 2024. We need 3 of those big vinyl things with our logos all over it for the red carpet, and a branded cloth for the main table. Also, add 5 of those roll-up signs for the hallways."
-
-          * **CORRECT JSON OUTPUT:**
-
-            ```json
-            {{
-              "delivery_deadline": "2024-11-01",
-              "request_date": "2024-10-01",
-              "items": [
-                {{
-                  "item_name": "Step-and-Repeat Backdrop",
-                  "quantity": 3
-                }},
-                {{
-                  "item_name": "Tablecloth",
-                  "quantity": 1
-                }},
-                {{
-                  "item_name": "Retractable Banner Stand",
-                  "quantity": 5
-                }}
-              ]
-            }}
-            ```
-
-        ### **4. Your Task**
-
-        Now, process the following client request.
-
-          * **VALID_ITEMS_LIST:** **{VALID_ITEMS_LIST}**
-          * **REQUEST_TEXT:**
-            > 
-            > -----
-            > ## **{request_text}**
-
-        Generate the JSON object:
-        """
-
-    # 3. Call the model and get the response
-    messages = [{"role": "user", "content": prompt}]
-    response = model(messages)
-
-    # 4. Clean up the response and parse the JSON
-    try:
-        # The model may return the JSON wrapped in markdown
-        cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
-        return json.loads(cleaned_response)
-    except json.JSONDecodeError:
-        print("Error: The model did not return valid JSON.")
-        return None
 
 
 #
@@ -1931,17 +1675,7 @@ class OrchestrationAgent(ToolCallingAgent):
 # project_starter.py
 
 # --- Prompt Templates ---
-STRUCTURE_REQUEST_PROMPT_TEMPLATE = """
-    Structure the following quote request: {request_text}.
-    Request date: {request_date}
-    Only return the structured quote request as a raw dictionary.
-"""
 
-CHECK_STOCK_PROMPT_TEMPLATE = """
-    Use the inventory agent to check the stock for item '{item_name}' on date {request_date}.
-    Your final answer MUST be the raw, unmodified dictionary that the inventory agent returns.
-    Do not change, reformat, or summarize it in any way.
-"""
 def call_multi_agent_system(request_text: str) -> str:
 
     orchestrator_agent = OrchestrationAgent(model=model)
