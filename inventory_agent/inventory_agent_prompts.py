@@ -14,3 +14,11 @@ CHECK_INVENTORY_PROMPT = """
 
     Begin.
 """
+
+
+PROCESS_TRANSACTION_PROMPT = """
+"Please process a client transaction by calling the order_item_stock tool. Use the parameters provided in the JSON object below:"
+
+JSON
+{transaction_item}
+"""

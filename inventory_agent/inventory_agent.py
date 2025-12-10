@@ -1,13 +1,15 @@
 import ast
 import json
 from smolagents import ToolCallingAgent, OpenAIServerModel
+from datetime import datetime
 from inventory_agent.inventory_agent_tools import (
     check_item_stock,
     order_item_stock
 )
 
 from inventory_agent.inventory_agent_prompts import (
-    CHECK_INVENTORY_PROMPT
+    CHECK_INVENTORY_PROMPT,
+    PROCESS_TRANSACTION_PROMPT
 )
 
 from project_starter import (
@@ -27,6 +29,7 @@ class InventoryAgent(ToolCallingAgent):
 
 if __name__ == "__main__":
     from project_starter import model
+    format_string = "%Y-%m-%d"
     request_list = [
         "tests/quote_agent/test1",
         "tests/quote_agent/test2",
@@ -40,9 +43,40 @@ if __name__ == "__main__":
             request = json.load(f)
 
         agent = InventoryAgent(model=model)
+        transaction_items = []
         for item in request["items"]:
+            delivery_deadline = datetime.strptime(request["delivery_deadline"], format_string)
             result = agent.run(CHECK_INVENTORY_PROMPT.format(item_name=item["item_name"], delivery_deadline=request["delivery_deadline"]))
             item_data = ast.literal_eval(result)
-            item_data["item_delivery_deadline"] = get_supplier_delivery_date(request["delivery_deadline"], item["quantity"])
             print(f"item_data: {item_data}")
+            item_delivery_deadline_str = get_supplier_delivery_date(request["delivery_deadline"], item["quantity"])
+            item_delivery_deadline = datetime.strptime(item_delivery_deadline_str, format_string)
+            item_data["item_delivery_deadline"] = item_delivery_deadline
+            transaction_item = {
+              "item_name": item["item_name"],
+              "transaction_type": "sales",
+              "quantity": item["quantity"],
+              "price": item_data["unit_price"]*item["quantity"],
+              "date": item_delivery_deadline_str
+            }
+            if item_delivery_deadline > delivery_deadline or item_data["current_stock"] < item["quantity"]:
+                transaction_item["quantity"] = -1
+            transaction_items += [transaction_item]
+        quantities = [transaction_item["quantity"] for transaction_item in transaction_items]
+        if -1 in quantities:
+            print("Could not process quote")
+        else:
+            # Process quote
+            stock_items = []
+            for transaction_item in transaction_items:
+                agent.run(PROCESS_TRANSACTION_PROMPT.format(transaction_item=json.dumps(transaction_item)))
+                result = agent.run(CHECK_INVENTORY_PROMPT.format(item_name=transaction_item["item_name"],
+                                                                 delivery_deadline=request["delivery_deadline"]))
+                item_data = ast.literal_eval(result)
+                stock_balance = item_data["current_stock"] - item_data["min_stock_level"]
+                if stock_balance < 0:
+                    transaction_item["transaction_type"] = "stock_orders"
+                    agent.run(PROCESS_TRANSACTION_PROMPT.format(transaction_item=json.dumps(transaction_item)))
+
+
         print("#"*200)
