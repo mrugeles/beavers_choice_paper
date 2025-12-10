@@ -611,106 +611,7 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 
 
 # Tools for inventory agent
-@tool
-def check_item_stock(
-        item_name: str,
-        as_of_date: Union[str, datetime]) -> Dict:
-    """
-    Check the current stock level of a specific item as of a given date.
-    Args:
-        item_name (str): The name of the item to check.
-        as_of_date (str): The date (in ISO format) to check stock as of.
-        task (str): The task context, either 'structure_request_only' or 'full_quote_calculation'.
-    Returns:
-        int: The current stock level of the item.
-    """
-    if item_name in VALID_ITEMS_LIST:
-        stock = get_stock_level(item_name, as_of_date)
-        print(f"DEBUG: Stock DataFrame for '{item_name}' as of {as_of_date}:\n{stock}")
-        stock = int(stock["current_stock"].iloc[0])
-        print(f"DEBUG: Current stock of '{item_name}' as of {as_of_date} is {stock}")
-        return {"item_name": item_name, "current_stock": stock, "is_valid_item": True}
-    else:
-        return {"item_name": item_name, "current_stock": 0, "is_valid_item": False}
 
-
-@tool
-def check_item_min_stock(item_name: str) -> int:
-    """
-    Check the current stock level of a specific item as of a given date.
-    Args:
-        item_name (str): The name of the item to check.
-        as_of_date (str): The date (in ISO format) to check stock as of.
-    Returns:
-        int: The current stock level of the item.
-    """
-    query = """
-            SELECT
-            min_stock_level  
-            FROM inventory 
-            WHERE
-            item_name = :item_name
-        """
-
-    # Execute the query with the date parameter
-    result = pd.read_sql(query, db_engine, params={"item_name": item_name})
-    min_stock_level = int(result["min_stock_level"].iloc[0])
-    # Convert the result into a dictionary {item_name: stock}
-    return min_stock_level
-
-@tool
-def order_item_stock(item_name: str,
-    transaction_type: str,
-    quantity: int,
-    price: float,
-    date: Union[str, datetime]) -> int:
-    """
-    Place an order for a specific item and quantity, and return the transaction code.
-    Args:
-        item_name (str): The name of the item involved in the transaction.
-        transaction_type (str): Either 'stock_orders' or 'sales'.
-        quantity (int): Number of units involved in the transaction.
-        price (float): Total price of the transaction.
-        date (str or datetime): Date of the transaction in ISO 8601 format.
-    Returns:
-        int: The transaction ID of the order.
-    """
-    return create_transaction(
-        item_name=item_name,
-        transaction_type=transaction_type,
-        quantity=quantity,
-        price=price,
-        date=date,
-    )
-
-@tool
-def get_item_delivery_date(order_date: str, quantity: int) -> str:
-    """
-    Get the estimated delivery date from the supplier for a specific item and quantity based on the order date.
-    Args:
-        quantity (int): The number of units ordered.
-        order_date (str): The date the order was placed (in ISO format).
-    Returns:
-        str: The estimated delivery date (in ISO format).
-    """
-    return get_supplier_delivery_date(order_date, quantity)
-
-
-@tool
-def get_item_unit_price(item_name: str) -> float:
-    """
-    Get the unit price of a specific item from the inventory.
-    Args:
-        item_name (str): The name of the item.
-    Returns:
-        float: The unit price of the item.
-    """
-    inventory_df = pd.read_sql("SELECT * FROM inventory", db_engine)
-    item_row = inventory_df[inventory_df["item_name"] == item_name]
-    if not item_row.empty:
-        return float(item_row.iloc[0]["unit_price"])
-    else:
-        raise ValueError(f"Item '{item_name}' not found in inventory.")
 
 # Tools for quoting agent
 VALID_ITEMS_LIST = ','.join([item_supply["item_name"] for item_supply in paper_supplies])
@@ -1238,15 +1139,18 @@ def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.Data
     # SQL query to compute net stock level for the item
     stock_query = """
         SELECT
-            item_name,
+            t.item_name,
+            i.unit_price,
+            i.min_stock_level,
             COALESCE(SUM(CASE
-                WHEN transaction_type = 'stock_orders' THEN units
-                WHEN transaction_type = 'sales' THEN -units
+                WHEN t.transaction_type = 'stock_orders' THEN units
+                WHEN t.transaction_type = 'sales' THEN -units
                 ELSE 0
             END), 0) AS current_stock
-        FROM transactions
-        WHERE item_name = :item_name
-        AND transaction_date <= :as_of_date
+        FROM transactions t
+        inner join inventory i on t.item_name = i.item_name
+        WHERE t.item_name = :item_name
+        AND t.transaction_date <= :as_of_date
     """
 
     # Execute query and return result as a DataFrame
@@ -1551,16 +1455,7 @@ class QuoteAgent(ToolCallingAgent):
             description="Agent for generating quotes based on client requests.",
         )
 """
-class InventoryAgent(ToolCallingAgent):
-    """Agent for managing inventory."""
 
-    def __init__(self, model: OpenAIServerModel):
-        super().__init__(
-            tools=[check_item_stock, order_item_stock, get_item_delivery_date, get_item_unit_price],
-            model=model,
-            name="inventory_agent",
-            description="Agent for managing inventory. Check stock levels and order stock items.",
-        )
 
 
 INVENTORY_AGENT_PROMPT = """
