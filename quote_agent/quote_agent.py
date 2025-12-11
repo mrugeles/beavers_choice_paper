@@ -71,6 +71,7 @@ if __name__ == "__main__":
 
 
         # The agent will now infer the 'calculate_quote' tool and return raw JSON
+        print(f"structured_request_data_str: {structured_request_data_str}")
         final_result = quote_agent.run(QUOTE_REQUEST_PROMPT.format(
             structured_request_data=structured_request_data_str,
             historical_quotes_data=historical_quotes_data_str
