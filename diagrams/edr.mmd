@@ -1,0 +1,36 @@
+erDiagram
+    INVENTORY ||--o{ TRANSACTIONS : "tracks movement of"
+    QUOTE_REQUESTS ||--o| QUOTES : "generates"
+
+    INVENTORY {
+        string item_name PK "Natural Key"
+        string category
+        float unit_price
+        int current_stock "Initial Snapshot"
+        int min_stock_level
+    }
+
+    TRANSACTIONS {
+        int id PK "Auto-increment"
+        string item_name FK
+        string transaction_type "stock_orders | sales"
+        int units
+        float price
+        datetime transaction_date
+    }
+
+    QUOTE_REQUESTS {
+        int id PK
+        text response "Customer inquiry text"
+        text meta_fields "Other CSV columns"
+    }
+
+    QUOTES {
+        int request_id FK
+        float total_amount
+        text quote_explanation
+        datetime order_date
+        string job_type
+        string order_size
+        string event_type
+    }

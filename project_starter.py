@@ -1,3 +1,5 @@
+import json
+
 import pandas as pd
 import numpy as np
 import os
@@ -10,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Union
 from sqlalchemy import create_engine, Engine
 from smolagents import ToolCallingAgent, OpenAIServerModel, tool
+
 
 dotenv.load_dotenv()
 
@@ -217,7 +220,7 @@ def init_database(db_engine: Engine, seed: int = 137) -> Engine:
         # ----------------------------
         # 4. Generate inventory and seed stock
         # ----------------------------
-        inventory_df = generate_sample_inventory(paper_supplies, seed=seed)
+        inventory_df = generate_sample_inventory(paper_supplies, coverage=1, seed=seed)
 
         # Seed initial transactions
         initial_transactions = []
@@ -364,15 +367,18 @@ def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.Data
     # SQL query to compute net stock level for the item
     stock_query = """
         SELECT
-            item_name,
+            t.item_name,
             COALESCE(SUM(CASE
-                WHEN transaction_type = 'stock_orders' THEN units
-                WHEN transaction_type = 'sales' THEN -units
+                WHEN t.transaction_type = 'stock_orders' THEN units
+                WHEN t.transaction_type = 'sales' THEN -units
                 ELSE 0
-            END), 0) AS current_stock
-        FROM transactions
-        WHERE item_name = :item_name
-        AND transaction_date <= :as_of_date
+            END), 0) AS current_stock,
+            i.unit_price,
+            i.min_stock_level 
+        FROM transactions t
+        INNER JOIN inventory i on i.item_name = t.item_name 
+        WHERE t.item_name = :item_name
+        AND t.transaction_date <= :as_of_date
     """
 
     # Execute query and return result as a DataFrame
@@ -590,9 +596,10 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
     """
 
     # Execute parameterized query
+    print(f"DEBUG: Executing search_quote_history with query: {query} and params: {params}")
     with db_engine.connect() as conn:
         result = conn.execute(text(query), params)
-        return [dict(row) for row in result]
+        return [dict(row) for row in result.mappings()]
 
 ########################
 ########################
@@ -611,37 +618,563 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 
 
 # Tools for inventory agent
+CHECK_INVENTORY_PROMPT = """
+    You are a dedicated inventory execution agent.
+
+    **Your Goal:** Run the 'check_item_stock' tool exactly once for the item: "{item_name}" on date: "{delivery_deadline}".
+
+    **Strict Rules:**
+    1. Call ONLY the 'check_item_stock' tool. Do not call 'structure_request', 'get_quote_history', or any other tool.
+    2. Do not loop. Once the tool returns a result, your task is complete.
+    3. Your Final Answer must be the raw JSON dictionary returned by the tool.
+    4. Do NOT add any additional text, explanations, or formatting to the output.
+     
+
+    **Input Data:**
+    - Item: {item_name}
+    - Date: {delivery_deadline}
+
+    Begin.
+"""
+
+
+PROCESS_TRANSACTION_PROMPT = """
+"Please process a client transaction by calling the order_item_stock tool. Use the parameters provided in the JSON object below:"
+
+JSON
+{transaction_item}
+"""
+@tool
+def check_item_stock(
+        item_name: str,
+        as_of_date: Union[str, datetime]) -> Dict:
+    """
+        Queries the inventory system to check stock availability for a specific item on a given date.
+
+        Use this tool BEFORE generating a final quote or order to ensure the requested quantity
+        can be fulfilled. It validates the item name against the master catalog and returns
+        the quantity on hand.
+
+        Args:
+            item_name (str): The specific name of the product (e.g., "A4 Paper").
+            as_of_date (str): The reference date for the inventory check in 'YYYY-MM-DD' format.
+
+        Returns:
+            Dict: A dictionary with the following keys:
+                - 'item_name': The name of the item checked.
+                - 'current_stock': The available quantity (int). Returns 0 if the item is invalid.
+                - 'is_valid_item': Boolean indicating if the item name exists in the catalog.
+    """
+    if item_name in VALID_ITEMS_LIST:
+        result = get_stock_level(item_name, as_of_date)
+        if result["item_name"].iloc[0] is None:
+            return {"item_name": item_name, "current_stock": -1, "unit_price": -1, "min_stock_level": -1}
+        stock = int(result["current_stock"].iloc[0])
+        unit_price = float(result["unit_price"].iloc[0])
+        min_stock_level = float(result["min_stock_level"].iloc[0])
+        item = {"item_name": item_name, "current_stock": stock, "unit_price": unit_price, "min_stock_level": min_stock_level}
+        return item
+    else:
+        item = {"item_name": item_name, "current_stock": -1, "unit_price": -1, "min_stock_level": -1}
+        return item
+
+@tool
+def order_item_stock(item_name: str,
+    transaction_type: str,
+    quantity: int,
+    price: float,
+    date: Union[str, datetime]) -> int:
+    """
+    Place an order for a specific item and quantity, and return the transaction code.
+    Args:
+        item_name (str): The name of the item involved in the transaction.
+        transaction_type (str): Either 'stock_orders' or 'sales'.
+        quantity (int): Number of units involved in the transaction.
+        price (float): Total price of the transaction.
+        date (str or datetime): Date of the transaction in ISO 8601 format.
+    Returns:
+        int: The transaction ID of the order.
+    """
+    return create_transaction(
+        item_name=item_name,
+        transaction_type=transaction_type,
+        quantity=quantity,
+        price=price,
+        date=date,
+    )
+class InventoryAgent(ToolCallingAgent):
+    """Agent for managing inventory."""
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            tools=[check_item_stock, order_item_stock],
+            model=model,
+            name="inventory_agent",
+            description="Agent for managing inventory. Check stock levels and order stock items.",
+        )
 
 
 # Tools for quoting agent
 
+QUOTE_INFERENCE_PROMPT_TEMPLATE = """
+You are an expert quoting specialist. Your task is to analyze a new quote request and provide a rounded quote with a friendly, service-oriented explanation.
+
+You must follow these steps:
+1.  **Analyze the `new_quote_request`.**
+2.  **Determine the Baseline Price:**
+    * Check `historical_quotes_requests` for similar past jobs (matching `job_type`, `event_type`, `order_size`).
+    * If history exists, use the past `total_amount` as the baseline.
+    * **If `historical_quotes_requests` is empty or irrelevant, estimate a standard competitive market price** for the items in the `new_quote_request` as your baseline.
+3.  **Apply Discount:** Apply a "bulk order" or "special" discount to this baseline (conceptually reduce it by 5-10%).
+4.  **Calculate Final Amount:** Take the discounted price and **round it *down*** to the nearest "friendly" or "round" number (e.g., $93.50 becomes $90). This is your `inferred_total_amount`.
+5.  **Generate Explanation:** Create the `inferred_quote_explanation` strictly following the "Explanation Style Examples" below.
+
+**CRITICAL RULES FOR EXPLANATION:**
+* **Structure:** Must match the provided examples exactly.
+* **Content:** Start with "Thank you," list the items/quantities, mention the discount/rounding logic, and state the final price.
+* **NO METADATA:** Do NOT mention whether historical data was found or not. Do NOT say "Since there is no history..." or "Based on similar past jobs..."
+* **Focus:** Focus only on the items, the discount, and the friendly final price.
+
+---
+### Explanation Style Examples (Strictly follow this tone and structure)
+
+* **Example 1:** "Thank you for your large order! We have calculated the costs for 500 reams of A4 paper at $0.05 each, 300 reams of letter-sized paper at $0.06 each, and 200 reams of cardstock at $0.15 each. To reward your bulk order, we are pleased to offer a 10% discount on the total. This brings your total to a rounded and friendly price, making it easier for your budgeting needs."
+* **Example 2:** "Thank you for your order! For the high-quality A4 paper, you requested 500 sheets at $0.05 each, totaling $25. The cardstock is 300 sheets at $0.15 each, totaling $45. Lastly, the 200 sheets of colored paper at $0.10 each come to $20. Since you are ordering in bulk, I've applied a special discount bringing the total cost to a nice rounded number of $85, which simplifies your budget for the upcoming performance. The total delivery will be scheduled for April 15, 2025."
+* **Example 3:** "Thank you for your order! For the upcoming assembly, I've prepared a quote for 500 sheets of A4 paper, 300 sheets of colored paper, and 200 sheets of cardstock. By ordering in bulk, I've applied a discount to ensure the costs are rounded to a more agreeable total. The A4 paper and colored paper costs remain at their standard prices, while I've factored in a bulk discount on the cardstock to make the total even more appealing. This pricing approach should help us avoid feeling penny-pinched while ensuring you get the supplies you need for a successful event."
+
+---
+### Context: New Quote Request
+```json
+{new_quote_request_json}
+```
+
+###Context: Historical Quote Data
+```json
+{historical_quotes_json}
+```
+
+###Task: Inferred Quote Response Analyze the new_quote_request and (optionally) the historical_quotes_requests to provide your inferred quote response in the following JSON format. Do not include any other text or markdown formatting outside the JSON block.
+
+{{
+"inferred_total_amount": <float>,
+"inferred_quote_explanation": "<string>"
+}}
+"""
+
+STRUCTURE_REQUEST_PROMPT_TEMPLATE = """
+    Structure the following quote request.
+    * **REQUEST_TEXT:**
+            > 
+            > -----
+            > ## **{request_text}**
+    * **REQUEST_DATE: ** **{request_date}**
+    
+    - Call only the 'structure_request(request_text: str, request_date: str)' tool.
+    - Only return the structured quote request as a raw dictionary.
+"""
+
+QUOTE_HISTORY_PROMPT = """
+      Call the 'search_quote_history(structured_request: str)' tool. 
+
+      You MUST pass the string below as the 'items' argument to the tool:
+
+      {items}
+
+      Your final answer MUST be only the raw JSON string output from the tool.
+      Do not add any conversational text, explanation, or summarization.
+      """
+
+QUOTE_REQUEST_PROMPT = """
+                You are provided with two final, pre-processed pieces of data:
+
+                1. structured_request: {structured_request_data}
+                2. historical_quotes: {historical_quotes_data}
+
+                Your task is to calculate the final inferred quote using this data directly. 
+                **Do not call 'structure_request' or 'get_quote_history' again.**
+                Use the provided data as-is.
+
+                Your final answer MUST be only the raw JSON dictionary containing 
+                'inferred_total_amount' and 'inferred_quote_explanation'. 
+                Do not add any conversational text.
+                """
+@tool
+def structure_request(request_text: str, request_date: str) -> Dict:
+    """
+        Parses unstructured natural language client requests into a structured sales order.
+
+        Use this tool when a user provides a raw description of an order (e.g., an email or message)
+        and you need to extract specific details like delivery deadlines, item quantities, and standardized product names.
+
+        Args:
+            request_text: The raw, unstructured text containing the client's order requirements (e.g., "I need 5 banners by Friday").
+            request_date: The reference date for the request in 'YYYY-MM-DD' format. Required to resolve relative dates like "next Friday" or "tomorrow".
+
+        Returns:
+            A dictionary containing keys: 'delivery_deadline', 'request_date', and a list of 'items' with mapped names and quantities.
+        """
+    # 2. Create a detailed prompt for the model
+
+    prompt = f"""
+        **Context:** You are an expert data extraction agent. Your task is to analyze a client request and extract 
+        the delivery deadline and a list of items into a structured JSON object. You must strictly adhere to the 
+        provided schema, rules, and item list.
+
+        ### **1. JSON Output Schema**
+
+        The final JSON object must follow this exact structure.
+
+        ```json
+        {{
+          "delivery_deadline": "string (YYYY-MM-DD)",
+          "request_date": "string (YYYY-MM-DD)",
+          "items": [
+            {{
+              "item_name": "string",
+              "quantity": "integer"
+            }}
+          ]
+        }}
+        ```
+
+        ### **2. Rules and Constraints**
+
+          * **Item Mapping:** For each item mentioned in the client's request, find the most semantically similar name from the `VALID_ITEMS_LIST` and use it for the `item_name` field.
+          * **Date Formatting:** The `delivery_deadline` in the output must be in `YYYY-MM-DD` format.
+          * **Missing Information:** If any field's information is not present in the request text, use `null` as its value in the JSON output.
+
+        ### **3. Example**
+
+        Here is an example of how to process a request correctly.
+
+          * **VALID_ITEMS_LIST:** `["Corporate Banner", "Step-and-Repeat Backdrop", "Podium Sign", "Tablecloth", "Retractable Banner Stand"]`
+
+          * **REQUEST_TEXT:**
+
+            > "Hey team, we've got the annual TechGala coming up. It's a pretty big job. Order date is Oct 28, 2024. We'll need everything delivered by Nov 1, 2024. We need 3 of those big vinyl things with our logos all over it for the red carpet, and a branded cloth for the main table. Also, add 5 of those roll-up signs for the hallways."
+
+          * **CORRECT JSON OUTPUT:**
+
+            ```json
+            {{
+              "delivery_deadline": "2024-11-01",
+              "request_date": "2024-10-01",
+              "items": [
+                {{
+                  "item_name": "Step-and-Repeat Backdrop",
+                  "quantity": 3
+                }},
+                {{
+                  "item_name": "Tablecloth",
+                  "quantity": 1
+                }},
+                {{
+                  "item_name": "Retractable Banner Stand",
+                  "quantity": 5
+                }}
+              ]
+            }}
+            ```
+
+        ### **4. Your Task**
+
+        Now, process the following client request.
+
+          * **VALID_ITEMS_LIST:** **{VALID_ITEMS_LIST}**
+          * **REQUEST_DATE: ** **{request_date}**
+          * **REQUEST_TEXT:**
+            > 
+            > -----
+            > ## **{request_text}**
+
+        Generate the JSON object:
+        """
+
+    # 3. Call the model and get the response
+    messages = [{"role": "user", "content": prompt}]
+    response = model(messages)
+
+    # 4. Clean up the response and parse the JSON
+    try:
+        # The model may return the JSON wrapped in markdown
+        cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
+        return json.loads(cleaned_response)
+    except json.JSONDecodeError:
+        print("Error: The model did not return valid JSON.")
+        return None
+
+@tool
+def get_quote_history(search_terms: List[str]) -> List[Dict]:
+    """
+        Retrieve a list of historical quotes that match any of the provided search terms.
+
+        The function searches both the original customer request (from `quote_requests`) and
+        the explanation for the quote (from `quotes`) for each keyword. Results are sorted by
+        most recent order date and limited by the `limit` parameter.
+
+        Args:
+            search_terms (List[str]): List of terms to match against customer requests and explanations.
+            limit (int, optional): Maximum number of quote records to return. Default is 5.
+
+        Returns:
+            List[Dict]: A list of matching quotes, each represented as a dictionary with fields:
+                - original_request
+                - total_amount
+                - quote_explanation
+                - job_type
+                - order_size
+                - event_type
+                - order_date
+    """
+    return search_quote_history(search_terms, limit=5)
+
+@tool
+def calculate_quote(structured_request:str, historical_quotes: str) -> Dict:
+    """
+        Generates a financial quote and pricing explanation based on a specific order and historical pricing data.
+
+        Use this tool AFTER you have successfully structured the client's request. It compares the current
+        request against historical data to infer a consistent price.
+
+        Args:
+            structured_request (str): A JSON string representing the order details (output from the 'structure_request' tool).
+                                      Must contain 'items' and 'quantity'.
+            historical_quotes (str): A JSON string containing a list of past finalized quotes.
+                                     Used as context to ensure the new quote aligns with previous pricing logic.
+
+        Returns:
+            Dict: A dictionary containing the calculated 'total_amount', a breakdown of costs, and an 'explanation' field describing how the price was determined.
+        """
+    new_quote_request_json = structured_request
+    historical_quotes_json = historical_quotes
+
+    prompt = QUOTE_INFERENCE_PROMPT_TEMPLATE.format(
+        new_quote_request_json=new_quote_request_json,
+        historical_quotes_json=historical_quotes_json
+    )
+    messages = [{"role": "user", "content": prompt}]
+    response = model(messages)
+
+    try:
+        # The model may return the JSON wrapped in markdown
+        cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
+        return json.loads(cleaned_response)
+    except json.JSONDecodeError:
+        print("Error: The model did not return valid JSON.")
+        return None
+
+
+@tool
+def calculate_quote_no_discount(structured_request:str, historical_quotes: str) -> Dict:
+    """
+        Generates a financial quote and pricing explanation based on a specific order and historical pricing data.
+
+        Use this tool AFTER you have successfully structured the client's request. It compares the current
+        request against historical data to infer a consistent price.
+
+        Args:
+            structured_request (str): A JSON string representing the order details (output from the 'structure_request' tool).
+                                      Must contain 'items' and 'quantity'.
+            historical_quotes (str): A JSON string containing a list of past finalized quotes.
+                                     Used as context to ensure the new quote aligns with previous pricing logic.
+
+        Returns:
+            Dict: A dictionary containing the calculated 'total_amount', a breakdown of costs, and an 'explanation' field describing how the price was determined.
+        """
+    new_quote_request_json = structured_request
+    historical_quotes_json = historical_quotes
+
+    prompt = QUOTE_INFERENCE_PROMPT_TEMPLATE.format(
+        new_quote_request_json=new_quote_request_json,
+        historical_quotes_json=historical_quotes_json
+    )
+    messages = [{"role": "user", "content": prompt}]
+    response = model(messages)
+
+    try:
+        # The model may return the JSON wrapped in markdown
+        cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
+        return json.loads(cleaned_response)
+    except json.JSONDecodeError:
+        print("Error: The model did not return valid JSON.")
+        return None
+class QuoteAgent(ToolCallingAgent):
+    """Agent for generating quotes."""
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            tools=[structure_request, get_quote_history, calculate_quote],
+            model=model,
+            name="quote_agent",
+            description="Agent for generating quotes based on client requests.",
+        )
 
 # Tools for ordering agent
 
 
 # Set up your agents and create an orchestration agent that will manage them.
+def get_unit_price(item_name: str) -> float:
+    """
+    Tool to get the unit price of an item.
+    Args:
+    item_name (str): The name of the item.
+    Returns:
+    float: The unit price of the item.
+    """
+    # In a real implementation, this would query a database or pricing service
+    for item in paper_supplies:
+        if item['item_name'] == item_name:
+            return item['unit_price']
+    return 0.0
+class OrchestratorAgent(ToolCallingAgent):
+    """Agent for generating quotes."""
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            tools=[],
+            model=model,
+            name="orchestrator_agent",
+            description="Orchestrates the full lifecycle of a client quote request, from data extraction and "
+                        "inventory validation to final price calculation."
+        )
+        self.quote_agent = QuoteAgent(model=model)
+        self.inventory_agent = InventoryAgent(model=model)
+
+    def process_quote_request(self, request: str, request_date: str) -> str:
+        response = None
+        format_string = "%Y-%m-%d"
+        # Step 1: Structure the request
+        request = self.structure_quote_request(request, request_date)
+        # Check stock
+        for item in request["items"]:
+            delivery_deadline = datetime.strptime(request["delivery_deadline"], format_string)
+            item = self.get_item_inventory(format_string, item, request)
+
+            if (item["current_stock"] < item["quantity"]) and (item["supplier_delivery_date"] > delivery_deadline):
+                print("Could not process quote due to insufficient stock.")
+                return "Could not process quote due to insufficient stock."
+
+            if item["supplier_delivery_date"] is not None:
+                item["supplier_delivery_date"] = item["supplier_delivery_date"].strftime(format_string)
+        # Create quote
+        ## Get the historical quotes (this will be a JSON string)
+        items = [item['item_name'] for item in request.get('items', [])]
+        items = ','.join(items)
+        historical_quotes_data_str = self.quote_agent.run(QUOTE_HISTORY_PROMPT.format(items=items))
+
+        structured_request_data_str = json.dumps(request)
+        # The agent will now infer the 'calculate_quote' tool and return raw JSON
+        final_result = self.quote_agent.run(QUOTE_REQUEST_PROMPT.format(
+            structured_request_data=structured_request_data_str,
+            historical_quotes_data=historical_quotes_data_str
+        ))
+
+        final_result = str(final_result)
+        final_result = ast.literal_eval(final_result)
+        print(f"final_result: {final_result}")
+        print(f"request: {request}")
+        response = final_result["inferred_quote_explanation"]
+        for item in request["items"]:
+            transaction_item = {
+                "item_name": item["item_name"],
+                "transaction_type": "sales",
+                "quantity": item["quantity"],
+                "price": get_unit_price(item["item_name"]) * item["quantity"],
+                "date": request["request_date"]
+            }
+            if item["current_stock"] == -1:
+                transaction_item["quantity"] = 0
+            # Sales transaction
+            transaction_id = self.inventory_agent.run(PROCESS_TRANSACTION_PROMPT.format(transaction_item=transaction_item))
+            print(f"transaction_id: {transaction_id}")
+            item = self.get_item_inventory(format_string, item, request)
+            if item["current_stock"] < item["min_stock_level"]:
+                order_quantity = item["min_stock_level"] * 2 - item["current_stock"]
+                order_transaction_item = {
+                    "item_name": item["item_name"],
+                    "transaction_type": "stock_orders",
+                    "quantity": order_quantity,
+                    "price": get_unit_price(item["item_name"]) * order_quantity,
+                    "date": request["request_date"]
+                }
+                # Order stock transaction
+                order_transaction_id = self.inventory_agent.run(PROCESS_TRANSACTION_PROMPT.format(transaction_item=order_transaction_item))
+                print(f"order_transaction_id: {order_transaction_id}")
+
+
+        # Sales transaction
+        # Update stock
+        # Check stock
+        ## stock_orders for items with quantity < min stock
+
+        return response
+
+    def get_item_inventory(self, format_string, item, request):
+
+
+        item_data = self.inventory_agent.run(CHECK_INVENTORY_PROMPT.format(item_name=item["item_name"],
+                                                                                delivery_deadline=request[
+                                                                                    "delivery_deadline"]))
+        supplier_delivery_date_str = get_supplier_delivery_date(request["request_date"], item["quantity"])
+        supplier_delivery_date = datetime.strptime(supplier_delivery_date_str, format_string)
+        item["current_stock"] = item_data["current_stock"]
+        item["min_stock_level"] = item_data["min_stock_level"]
+        item["supplier_delivery_date"] = supplier_delivery_date
+        print(f"item: {item}")
+
+        return item
+
+    def structure_quote_request(self, request, request_date):
+        structure_prompt = STRUCTURE_REQUEST_PROMPT_TEMPLATE.format(request_date=request_date,
+                                                                    request_text=request)
+        result = self.quote_agent.run(structure_prompt)
+        result_str = str(result)
+        structured_request_data = ast.literal_eval(result_str)
+        total_amount = 0.0
+        for item in structured_request_data['items']:
+            item_name = item['item_name']
+            item['unit_price'] = get_unit_price(item_name)
+            item['total_price'] = item['unit_price'] * item['quantity']
+            total_amount += item['total_price']
+        structured_request_data['total_amount'] = round(total_amount, 2)
+        return structured_request_data
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
 def call_multi_agent_system(row):
     response = None
-    # Structure the request
-    # Check stock
-    # If delivery date > request date: End
-    # If no stock: End
-    # Create quote
-    # Sales transaction
-    # Update stock
-    # Check stock
-    ## stock_orders for items with quantity < min stock
+    format_string = "%Y-%m-%d"
+    orchestrator_agent = OrchestratorAgent(model=model)
 
+    response = orchestrator_agent.process_quote_request(row["request"], row["request_date"].strftime(format_string))
     return response
+
+
+def get_build_stock_status(format_string, inventory_agent, item, request, transaction_items):
+    delivery_deadline = datetime.strptime(request["delivery_deadline"], format_string)
+    result = inventory_agent.run(
+        CHECK_INVENTORY_PROMPT.format(item_name=item["item_name"], delivery_deadline=request["delivery_deadline"]))
+    item_data = ast.literal_eval(result)
+    item_delivery_deadline_str = get_supplier_delivery_date(request["delivery_deadline"], item["quantity"])
+    item_delivery_deadline = datetime.strptime(item_delivery_deadline_str, format_string)
+    item_data["item_delivery_deadline"] = item_delivery_deadline
+    transaction_item = {
+        "item_name": item["item_name"],
+        "transaction_type": "sales",
+        "quantity": item["quantity"],
+        "price": item_data["unit_price"] * item["quantity"],
+        "date": item_delivery_deadline_str
+    }
+    if item_delivery_deadline > delivery_deadline or item_data["current_stock"] < item["quantity"]:
+        transaction_item["quantity"] = -1
+    return transaction_item
+
 
 def run_test_scenarios():
 
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
