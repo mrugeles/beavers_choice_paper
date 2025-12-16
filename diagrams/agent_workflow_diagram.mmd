@@ -1,0 +1,77 @@
+graph TD
+    %% Define Styles
+    classDef orchestrator fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef agent fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef tool fill:#e1f5fe,stroke:#333,stroke-width:1px,stroke-dasharray: 5 5;
+    classDef db fill:#fff9c4,stroke:#d4e157,stroke-width:2px;
+
+    %% START
+    UserRequest([User Request: Raw Text + Date]) --> Orch
+
+    %% ORCHESTRATOR AGENT
+    subgraph OrchestratorScope [Orchestrator Agent Scope]
+        Orch[<b>OrchestratorAgent</b><br/>Responsibility: Manage workflow lifecycle<br/>and delegate tasks.]:::orchestrator
+    end
+
+    %% QUOTE AGENT
+    subgraph QuoteScope [Quote Agent Scope]
+        QA[<b>QuoteAgent</b><br/>Responsibility: Parse NLP<br/>and calculate pricing.]:::agent
+
+        %% Tools for Quote Agent
+        QTool1(<b>Tool: structure_request</b><br/>Purpose: Parse natural language<br/>Helper: model call):::tool
+        QTool2(<b>Tool: get_quote_history</b><br/>Purpose: Find past orders<br/>Helper: search_quote_history):::tool
+        QTool3(<b>Tool: calculate_quote</b><br/>Purpose: Infer price<br/>Helper: model call):::tool
+    end
+
+    %% INVENTORY AGENT
+    subgraph InventoryScope [Inventory Agent Scope]
+        IA[<b>InventoryAgent</b><br/>Responsibility: Check stock<br/>and execute transactions.]:::agent
+
+        %% Tools for Inventory Agent
+        ITool1(<b>Tool: check_item_stock</b><br/>Purpose: Query stock levels<br/>Helper: get_stock_level):::tool
+        ITool2(<b>Tool: order_item_stock</b><br/>Purpose: Record transactions<br/>Helper: create_transaction):::tool
+    end
+
+    %% DATABASE
+    DB[(<b>SQLite Database</b><br/>Tables: inventory, transactions)]:::db
+
+    %% WORKFLOW / INTERACTIONS
+
+    %% Step 1: Structure
+    Orch -- "1. Send Raw Text" --> QA
+    QA -.-> QTool1
+    QTool1 -.-> QA
+    QA -- "Return structured request" --> Orch
+
+    %% Step 2: Check Inventory
+    Orch -- "2. Check items" --> IA
+    IA -.-> ITool1
+    ITool1 -- "Query DB" --- DB
+    ITool1 -.-> IA
+    IA -- "Return Stock Status" --> Orch
+
+    %% Step 3: Get History
+    Orch -- "3. Request History" --> QA
+    QA -.-> QTool2
+    QTool2 -- "Query DB" --- DB
+    QTool2 -.-> QA
+
+    %% Step 4: Calculate Quote
+    QA -.-> QTool3
+    QTool3 -.-> QA
+    QA -- "Return Final Quote" --> Orch
+
+    %% Step 5: Process Transactions
+    Orch -- "4. Process Sales" --> IA
+    IA -.-> ITool2
+    ITool2 -- "Insert Sales Record" --- DB
+
+    %% Step 6: Restock (Conditional)
+    Orch -- "5. Restock if needed" --> IA
+    IA -.-> ITool2
+    ITool2 -- "Insert Stock Order" --- DB
+    ITool2 -.-> IA
+    IA -- "Confirm Success" --> Orch
+
+    %% END
+    Orch --> FinalResponse([Return Final Quote to User])
