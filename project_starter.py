@@ -899,7 +899,7 @@ def structure_request(request_text: str, request_date: str) -> Dict:
         return json.loads(cleaned_response)
     except json.JSONDecodeError:
         print("Error: The model did not return valid JSON.")
-        return None
+        return {"error": "The model did not return valid JSON."}
 
 @tool
 def get_quote_history(search_terms: List[str]) -> List[Dict]:
@@ -943,6 +943,11 @@ def calculate_quote(structured_request:str, historical_quotes: str) -> Dict:
         Returns:
             Dict: A dictionary containing the calculated 'total_amount', a breakdown of costs, and an 'explanation' field describing how the price was determined.
         """
+    try:
+        json.loads(structured_request)
+        json.loads(historical_quotes)
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON provided: {str(e)}"}
     new_quote_request_json = structured_request
     historical_quotes_json = historical_quotes
 
@@ -959,7 +964,7 @@ def calculate_quote(structured_request:str, historical_quotes: str) -> Dict:
         return json.loads(cleaned_response)
     except json.JSONDecodeError:
         print("Error: The model did not return valid JSON.")
-        return None
+        return {"error": "The model did not return valid JSON."}
 
 class QuoteAgent(ToolCallingAgent):
     """Agent for generating quotes."""
