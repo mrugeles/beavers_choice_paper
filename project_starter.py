@@ -83,7 +83,7 @@ paper_supplies = [
     {"item_name": "220 gsm poster paper",             "category": "specialty",    "unit_price": 0.35},
 ]
 
-VALID_ITEMS_LIST = ','.join([item_supply["item_name"] for item_supply in paper_supplies])
+VALID_ITEMS_LIST = [item_supply["item_name"] for item_supply in paper_supplies]
 
 
 # Given below are some utility functions you can use to implement your multi-agent system
@@ -405,7 +405,6 @@ def get_supplier_delivery_date(input_date_str: str, quantity: int) -> str:
     Returns:
         str: Estimated delivery date in ISO format (YYYY-MM-DD).
     """
-    # Debug log (comment out in production if needed)
     print(f"FUNC (get_supplier_delivery_date): Calculating for qty {quantity} from date string '{input_date_str}'")
 
     # Attempt to parse the input date
@@ -596,7 +595,6 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
     """
 
     # Execute parameterized query
-    print(f"DEBUG: Executing search_quote_history with query: {query} and params: {params}")
     with db_engine.connect() as conn:
         result = conn.execute(text(query), params)
         return [dict(row) for row in result.mappings()]
@@ -901,7 +899,7 @@ def structure_request(request_text: str, request_date: str) -> Dict:
         return json.loads(cleaned_response)
     except json.JSONDecodeError:
         print("Error: The model did not return valid JSON.")
-        return None
+        return {"error": "The model did not return valid JSON."}
 
 @tool
 def get_quote_history(search_terms: List[str]) -> List[Dict]:
@@ -945,6 +943,11 @@ def calculate_quote(structured_request:str, historical_quotes: str) -> Dict:
         Returns:
             Dict: A dictionary containing the calculated 'total_amount', a breakdown of costs, and an 'explanation' field describing how the price was determined.
         """
+    try:
+        json.loads(structured_request)
+        json.loads(historical_quotes)
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON provided: {str(e)}"}
     new_quote_request_json = structured_request
     historical_quotes_json = historical_quotes
 
@@ -961,43 +964,8 @@ def calculate_quote(structured_request:str, historical_quotes: str) -> Dict:
         return json.loads(cleaned_response)
     except json.JSONDecodeError:
         print("Error: The model did not return valid JSON.")
-        return None
+        return {"error": "The model did not return valid JSON."}
 
-
-@tool
-def calculate_quote_no_discount(structured_request:str, historical_quotes: str) -> Dict:
-    """
-        Generates a financial quote and pricing explanation based on a specific order and historical pricing data.
-
-        Use this tool AFTER you have successfully structured the client's request. It compares the current
-        request against historical data to infer a consistent price.
-
-        Args:
-            structured_request (str): A JSON string representing the order details (output from the 'structure_request' tool).
-                                      Must contain 'items' and 'quantity'.
-            historical_quotes (str): A JSON string containing a list of past finalized quotes.
-                                     Used as context to ensure the new quote aligns with previous pricing logic.
-
-        Returns:
-            Dict: A dictionary containing the calculated 'total_amount', a breakdown of costs, and an 'explanation' field describing how the price was determined.
-        """
-    new_quote_request_json = structured_request
-    historical_quotes_json = historical_quotes
-
-    prompt = QUOTE_INFERENCE_PROMPT_TEMPLATE.format(
-        new_quote_request_json=new_quote_request_json,
-        historical_quotes_json=historical_quotes_json
-    )
-    messages = [{"role": "user", "content": prompt}]
-    response = model(messages)
-
-    try:
-        # The model may return the JSON wrapped in markdown
-        cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
-        return json.loads(cleaned_response)
-    except json.JSONDecodeError:
-        print("Error: The model did not return valid JSON.")
-        return None
 class QuoteAgent(ToolCallingAgent):
     """Agent for generating quotes."""
 
@@ -1151,26 +1119,6 @@ def call_multi_agent_system(row):
     return response
 
 
-def get_build_stock_status(format_string, inventory_agent, item, request, transaction_items):
-    delivery_deadline = datetime.strptime(request["delivery_deadline"], format_string)
-    result = inventory_agent.run(
-        CHECK_INVENTORY_PROMPT.format(item_name=item["item_name"], delivery_deadline=request["delivery_deadline"]))
-    item_data = ast.literal_eval(result)
-    item_delivery_deadline_str = get_supplier_delivery_date(request["delivery_deadline"], item["quantity"])
-    item_delivery_deadline = datetime.strptime(item_delivery_deadline_str, format_string)
-    item_data["item_delivery_deadline"] = item_delivery_deadline
-    transaction_item = {
-        "item_name": item["item_name"],
-        "transaction_type": "sales",
-        "quantity": item["quantity"],
-        "price": item_data["unit_price"] * item["quantity"],
-        "date": item_delivery_deadline_str
-    }
-    if item_delivery_deadline > delivery_deadline or item_data["current_stock"] < item["quantity"]:
-        transaction_item["quantity"] = -1
-    return transaction_item
-
-
 def run_test_scenarios():
 
     print("Initializing Database...")
@@ -1185,8 +1133,6 @@ def run_test_scenarios():
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
-
-    quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
 
     # Sort by date
     quote_requests_sample["request_date"] = pd.to_datetime(

@@ -1,77 +1,70 @@
-graph TD
-    %% Define Styles
-    classDef orchestrator fill:#f9f,stroke:#333,stroke-width:2px;
-    classDef agent fill:#bbf,stroke:#333,stroke-width:2px;
-    classDef tool fill:#e1f5fe,stroke:#333,stroke-width:1px,stroke-dasharray: 5 5;
-    classDef db fill:#fff9c4,stroke:#d4e157,stroke-width:2px;
+flowchart TB
+    classDef orchestrator fill:#f9f,stroke:#333,stroke-width:2px
+    classDef agent fill:#bbf,stroke:#333,stroke-width:2px
+    classDef tool fill:#e1f5fe,stroke:#333,stroke-width:1px,stroke-dasharray: 5 5
+    classDef db fill:#fff9c4,stroke:#d4e157,stroke-width:2px
 
-    %% START
-    UserRequest([User Request: Raw Text + Date]) --> Orch
+ subgraph OrchestratorScope["Orchestrator Agent Scope"]
+        Orch["<b>OrchestratorAgent</b><br>Responsibility: Manage workflow lifecycle<br>and delegate tasks."]
+  end
+ subgraph QuoteScope["Quote Agent Scope"]
+        QA["<b>QuoteAgent</b><br>Responsibility: Parse NLP<br>and calculate pricing."]
+        QTool1("<b>Tool: structure_request</b><br><b>Purpose:</b> Parse unstructured text into structured JSON<br>with delivery deadline, item names, and quantities<br><b>Input:</b> raw_text [str], current_date [str]<br><b>Output:</b> JSON Dict [items, deadline]")
+        LLMCall(["LLM Call"])
+        QTool1Error1["Could not process quote request"]
+        QTool2("<b>Tool: get_quote_history</b><br><b>Purpose:</b> Search historical quotes based on<br>item names to inform pricing<br><b>Input:</b> item_name [str]<br><b>Output:</b> List[Dict] [past prices]")
+        search_quote_history(["search_quote_history"])
+        QTool3("<b>Tool: calculate_quote</b><br><b>Purpose:</b> Generate final price with discounts and<br>friendly rounding based on structured request and historical quotes<br><b>Input:</b> structured_request [Dict], historical_quotes [list]<br><b>Output:</b> Final Quote [dict]")
+        LLMCall1(["LLM Call"])
+        QTool3Error1["Could not calculate quote"]
+  end
+ subgraph InventoryScope["Inventory Agent Scope"]
+        IA["<b>InventoryAgent</b><br>Responsibility: Check stock<br>and execute transactions."]
+        ITool1("<b>Tool: check_item_stock</b><br><b>Purpose:</b> Query current stock level, unit price,<br>and min_stock_level for a specific item<br><b>Input:</b> item_name [str], as_of_date [str]<br><b>Output:</b> Stock Info [dict]")
+        get_stock_level(["get_stock_level"])
+        ITool1Error1["Could not process quote due to insufficient stock"]
+        ITool2("<b>Tool: order_item_stock</b><br><b>Purpose:</b> Record sales or stock_orders<br>transactions in the database<br><b>Helper:</b> create_transaction<br><b>Input:</b> item_name, quantity, price, type<br><b>Output:</b> Transaction Status [dict]")
+        create_transaction(["create_transaction"])
 
-    %% ORCHESTRATOR AGENT
-    subgraph OrchestratorScope [Orchestrator Agent Scope]
-        Orch[<b>OrchestratorAgent</b><br/>Responsibility: Manage workflow lifecycle<br/>and delegate tasks.]:::orchestrator
-    end
-
-    %% QUOTE AGENT
-    subgraph QuoteScope [Quote Agent Scope]
-        QA[<b>QuoteAgent</b><br/>Responsibility: Parse NLP<br/>and calculate pricing.]:::agent
-
-        %% Tools for Quote Agent
-        QTool1(<b>Tool: structure_request</b><br/>Purpose: Parse natural language<br/>Helper: model call):::tool
-        QTool2(<b>Tool: get_quote_history</b><br/>Purpose: Find past orders<br/>Helper: search_quote_history):::tool
-        QTool3(<b>Tool: calculate_quote</b><br/>Purpose: Infer price<br/>Helper: model call):::tool
-    end
-
-    %% INVENTORY AGENT
-    subgraph InventoryScope [Inventory Agent Scope]
-        IA[<b>InventoryAgent</b><br/>Responsibility: Check stock<br/>and execute transactions.]:::agent
-
-        %% Tools for Inventory Agent
-        ITool1(<b>Tool: check_item_stock</b><br/>Purpose: Query stock levels<br/>Helper: get_stock_level):::tool
-        ITool2(<b>Tool: order_item_stock</b><br/>Purpose: Record transactions<br/>Helper: create_transaction):::tool
-    end
-
-    %% DATABASE
-    DB[(<b>SQLite Database</b><br/>Tables: inventory, transactions)]:::db
-
-    %% WORKFLOW / INTERACTIONS
-
-    %% Step 1: Structure
+  end
+    UserRequest(["User Request: Raw Text + Date"]) --> Orch
+    QTool1 --> LLMCall
+    QTool1 --Parsing fail---> QTool1Error1
+    QTool2 --> search_quote_history
+    QTool3 --> LLMCall1
+    QTool3 --Quote calculation fails---> QTool3Error1
+    ITool1 --> get_stock_level
+    ITool2 --> create_transaction
     Orch -- "1. Send Raw Text" --> QA
-    QA -.-> QTool1
+    QA -.-> QTool1 & QTool2 & QTool3
     QTool1 -.-> QA
-    QA -- "Return structured request" --> Orch
-
-    %% Step 2: Check Inventory
+    QA -- Return structured request --> Orch
     Orch -- "2. Check items" --> IA
-    IA -.-> ITool1
-    ITool1 -- "Query DB" --- DB
+    IA -.-> ITool1 & ITool2 & ITool2
+    ITool1 -- Query DB --- DB[("<b>SQLite Database</b><br>Tables: inventory, transactions")]
     ITool1 -.-> IA
-    IA -- "Return Stock Status" --> Orch
-
-    %% Step 3: Get History
+    ITool1 --Stock is insufficient---> ITool1Error1
+    IA -- Return Stock Status --> Orch
     Orch -- "3. Request History" --> QA
-    QA -.-> QTool2
-    QTool2 -- "Query DB" --- DB
+    QTool2 -- Query DB --- DB
     QTool2 -.-> QA
-
-    %% Step 4: Calculate Quote
-    QA -.-> QTool3
     QTool3 -.-> QA
-    QA -- "Return Final Quote" --> Orch
-
-    %% Step 5: Process Transactions
+    QA -- Return Final Quote --> Orch
     Orch -- "4. Process Sales" --> IA
-    IA -.-> ITool2
-    ITool2 -- "Insert Sales Record" --- DB
-
-    %% Step 6: Restock (Conditional)
+    ITool2 -- Insert Sales Record --- DB
     Orch -- "5. Restock if needed" --> IA
-    IA -.-> ITool2
-    ITool2 -- "Insert Stock Order" --- DB
+    ITool2 -- Insert Stock Order --- DB
     ITool2 -.-> IA
-    IA -- "Confirm Success" --> Orch
+    IA -- Confirm Success --> Orch
+    Orch --> FinalResponse(["Return Final Quote to User"])
+    
 
-    %% END
-    Orch --> FinalResponse([Return Final Quote to User])
+     Orch:::orchestrator
+     QA:::agent
+     QTool1:::tool
+     QTool2:::tool
+     QTool3:::tool
+     IA:::agent
+     ITool1:::tool
+     ITool2:::tool
+     DB:::db
