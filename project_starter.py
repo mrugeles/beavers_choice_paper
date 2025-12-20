@@ -83,7 +83,7 @@ paper_supplies = [
     {"item_name": "220 gsm poster paper",             "category": "specialty",    "unit_price": 0.35},
 ]
 
-VALID_ITEMS_LIST = [item_supply["item_name"] for item_supply in paper_supplies]
+#VALID_ITEMS_LIST = [item_supply["item_name"] for item_supply in paper_supplies]
 
 
 # Given below are some utility functions you can use to implement your multi-agent system
@@ -379,6 +379,7 @@ def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.Data
         INNER JOIN inventory i on i.item_name = t.item_name 
         WHERE t.item_name = :item_name
         AND t.transaction_date <= :as_of_date
+        AND t.transaction_date <= :as_of_date
     """
 
     # Execute query and return result as a DataFrame
@@ -631,6 +632,9 @@ CHECK_INVENTORY_PROMPT = """
     **Input Data:**
     - Item: {item_name}
     - Date: {delivery_deadline}
+    - Available Inventory: {available_inventory}
+    - Request Date: {request_date}
+    - Quantity: {quantity}
 
     Begin.
 """
@@ -642,10 +646,18 @@ PROCESS_TRANSACTION_PROMPT = """
 JSON
 {transaction_item}
 """
+
+CASH_BALANCE_PROMPT = """
+Calculate the current cash balance as of {as_of_date}.
+"""
+
 @tool
 def check_item_stock(
         item_name: str,
-        as_of_date: Union[str, datetime]) -> Dict:
+        as_of_date: Union[str, datetime],
+        available_inventory: str,
+        request_date: str,
+        quantity: int) -> Dict:
     """
         Queries the inventory system to check stock availability for a specific item on a given date.
 
@@ -656,6 +668,10 @@ def check_item_stock(
         Args:
             item_name (str): The specific name of the product (e.g., "A4 Paper").
             as_of_date (str): The reference date for the inventory check in 'YYYY-MM-DD' format.
+            available_inventory (str): A comma-separated string of valid product names
+            used to validate the 'item_name'.
+            request_date (str): The date for which the stock is being requested ('YYYY-MM-DD').
+            quantity (int): The number of units requested by the user.
 
         Returns:
             Dict: A dictionary with the following keys:
@@ -663,17 +679,21 @@ def check_item_stock(
                 - 'current_stock': The available quantity (int). Returns 0 if the item is invalid.
                 - 'is_valid_item': Boolean indicating if the item name exists in the catalog.
     """
-    if item_name in VALID_ITEMS_LIST:
+    available_inventory = available_inventory.split(",")
+    if item_name in available_inventory:
         result = get_stock_level(item_name, as_of_date)
         if result["item_name"].iloc[0] is None:
-            return {"item_name": item_name, "current_stock": -1, "unit_price": -1, "min_stock_level": -1}
+            print(f"DEBUG: item {item_name} not available in DB inventory as of {as_of_date}")
+            return {"item_name": item_name, "current_stock": -1, "unit_price": -1, "min_stock_level": -1, "supplier_delivery_date": None}
         stock = int(result["current_stock"].iloc[0])
         unit_price = float(result["unit_price"].iloc[0])
         min_stock_level = float(result["min_stock_level"].iloc[0])
-        item = {"item_name": item_name, "current_stock": stock, "unit_price": unit_price, "min_stock_level": min_stock_level}
+        supplier_delivery_date = get_supplier_delivery_date(request_date, quantity)
+        item = {"item_name": item_name, "current_stock": stock, "unit_price": unit_price, "min_stock_level": min_stock_level, "supplier_delivery_date": supplier_delivery_date}
         return item
     else:
-        item = {"item_name": item_name, "current_stock": -1, "unit_price": -1, "min_stock_level": -1}
+        print(f"DEBUG: item {item_name} not available in inventory as of {as_of_date}")
+        item = {"item_name": item_name, "current_stock": -1, "unit_price": -1, "min_stock_level": -1, "supplier_delivery_date": None}
         return item
 
 @tool
@@ -700,12 +720,46 @@ def order_item_stock(item_name: str,
         price=price,
         date=date,
     )
+
+@tool
+def get_inventory_availability(as_of_date: str) -> list[str]:
+    """
+    Returns a list of all item names currently in stock.
+
+    Use this tool to identify which products are available for sale
+    on a specific date before generating quotes or orders.
+
+    Args:
+        as_of_date: The reference date (YYYY-MM-DD) to check stock levels.
+
+    Returns:
+        A list of available product names. Returns an empty list if nothing is in stock.
+    """
+    inventory = get_all_inventory(as_of_date)
+    return list(inventory.keys())
+
+@tool
+def get_balance(as_of_date: str) -> float:
+    """
+        Calculate the current cash balance as of a specified date.
+
+        The balance is computed by subtracting total stock purchase costs ('stock_orders')
+        from total revenue ('sales') recorded in the transactions table up to the given date.
+
+        Args:
+            as_of_date (str or datetime): The cutoff date (inclusive) in ISO format or as a datetime object.
+
+        Returns:
+            float: Net cash balance as of the given date. Returns 0.0 if no transactions exist or an error occurs.
+        """
+    return get_cash_balance(as_of_date)
+
 class InventoryAgent(ToolCallingAgent):
     """Agent for managing inventory."""
 
     def __init__(self, model: OpenAIServerModel):
         super().__init__(
-            tools=[check_item_stock, order_item_stock],
+            tools=[check_item_stock, order_item_stock, get_inventory_availability, get_balance],
             model=model,
             name="inventory_agent",
             description="Agent for managing inventory. Check stock levels and order stock items.",
@@ -760,15 +814,22 @@ You must follow these steps:
 """
 
 STRUCTURE_REQUEST_PROMPT_TEMPLATE = """
-    Structure the following quote request.
-    * **REQUEST_TEXT:**
-            > 
-            > -----
-            > ## **{request_text}**
-    * **REQUEST_DATE: ** **{request_date}**
-    
-    - Call only the 'structure_request(request_text: str, request_date: str)' tool.
-    - Only return the structured quote request as a raw dictionary.
+    # SYSTEM INSTRUCTION
+    You are a data extraction pipeline. Your ONLY goal is to call 'structure_request' and then pass its output directly to 'final_answer'.
+
+    # INPUT DATA
+    * **REQUEST_TEXT:** {request_text}
+    * **REQUEST_DATE:** {request_date}
+    * **AVAILABLE_INVENTORY:** {available_inventory}
+
+    # STRICT CONSTRAINTS
+    1. Call 'structure_request' with the provided data.
+    2. Once you have the dictionary from the tool, pass that EXACT dictionary to 'final_answer'.
+    3. Do NOT summarize, do NOT explain, and do NOT add conversational text.
+    4. If an item is missing from inventory, the tool will handle it. Do NOT mention it in the final answer.
+
+    # EXECUTION
+    Extract the data now.
 """
 
 QUOTE_HISTORY_PROMPT = """
@@ -797,7 +858,7 @@ QUOTE_REQUEST_PROMPT = """
                 Do not add any conversational text.
                 """
 @tool
-def structure_request(request_text: str, request_date: str) -> Dict:
+def structure_request(request_text: str, request_date: str, available_inventory: str) -> Dict:
     """
         Parses unstructured natural language client requests into a structured sales order.
 
@@ -807,6 +868,7 @@ def structure_request(request_text: str, request_date: str) -> Dict:
         Args:
             request_text: The raw, unstructured text containing the client's order requirements (e.g., "I need 5 banners by Friday").
             request_date: The reference date for the request in 'YYYY-MM-DD' format. Required to resolve relative dates like "next Friday" or "tomorrow".
+            available_inventory: A comma-separated string or list of valid product names to map against.
 
         Returns:
             A dictionary containing keys: 'delivery_deadline', 'request_date', and a list of 'items' with mapped names and quantities.
@@ -840,6 +902,7 @@ def structure_request(request_text: str, request_date: str) -> Dict:
           * **Item Mapping:** For each item mentioned in the client's request, find the most semantically similar name from the `VALID_ITEMS_LIST` and use it for the `item_name` field.
           * **Date Formatting:** The `delivery_deadline` in the output must be in `YYYY-MM-DD` format.
           * **Missing Information:** If any field's information is not present in the request text, use `null` as its value in the JSON output.
+          * **Response format:** Only return the requested JSON, do not include aditional t
 
         ### **3. Example**
 
@@ -878,14 +941,15 @@ def structure_request(request_text: str, request_date: str) -> Dict:
 
         Now, process the following client request.
 
-          * **VALID_ITEMS_LIST:** **{VALID_ITEMS_LIST}**
+          * **VALID_ITEMS_LIST:** **{available_inventory}**
           * **REQUEST_DATE: ** **{request_date}**
           * **REQUEST_TEXT:**
             > 
             > -----
             > ## **{request_text}**
 
-        Generate the JSON object:
+        - Generate the JSON object for the data provided above.
+        - Only return the structured quote request as a raw dictionary.
         """
 
     # 3. Call the model and get the response
@@ -1009,103 +1073,155 @@ class OrchestratorAgent(ToolCallingAgent):
         self.inventory_agent = InventoryAgent(model=model)
 
     def process_quote_request(self, request: str, request_date: str) -> str:
-        response = None
+        response = ""
         format_string = "%Y-%m-%d"
         # Step 1: Structure the request
-        request = self.structure_quote_request(request, request_date)
+        print("================== Get available inventory")
+        available_inventory = self.inventory_agent.run(f"Get the list of all item names currently in stock as of date {request_date}.")
+        print("================== Structure request")
+        request = self.structure_quote_request(request, request_date, available_inventory)
+        if request is None:
+            return "Could not process quote due to agent error."
         # Check stock
         for item in request["items"]:
             delivery_deadline = datetime.strptime(request["delivery_deadline"], format_string)
-            item = self.get_item_inventory(format_string, item, request)
-
+            print("================== get_item_inventory")
+            item = self.get_item_inventory(format_string, item, request, available_inventory)
+            if item["current_stock"] == -1:
+                return "Could not process quote due to insufficient stock."
             if (item["current_stock"] < item["quantity"]) and (item["supplier_delivery_date"] > delivery_deadline):
                 print("Could not process quote due to insufficient stock.")
                 return "Could not process quote due to insufficient stock."
+            item["supplier_delivery_date"] = item["supplier_delivery_date"].strftime(format_string)
 
-            if item["supplier_delivery_date"] is not None:
-                item["supplier_delivery_date"] = item["supplier_delivery_date"].strftime(format_string)
         # Create quote
         ## Get the historical quotes (this will be a JSON string)
         items = [item['item_name'] for item in request.get('items', [])]
         items = ','.join(items)
+        print("================== Get quote history")
         historical_quotes_data_str = self.quote_agent.run(QUOTE_HISTORY_PROMPT.format(items=items))
-
         structured_request_data_str = json.dumps(request)
         # The agent will now infer the 'calculate_quote' tool and return raw JSON
+        print("================== Calculate quote")
         final_result = self.quote_agent.run(QUOTE_REQUEST_PROMPT.format(
             structured_request_data=structured_request_data_str,
             historical_quotes_data=historical_quotes_data_str
         ))
+        print("================== Processing quote")
 
         final_result = str(final_result)
         final_result = ast.literal_eval(final_result)
-        print(f"final_result: {final_result}")
-        print(f"request: {request}")
         response = final_result["inferred_quote_explanation"]
+        total = 0
         for item in request["items"]:
             transaction_item = {
                 "item_name": item["item_name"],
                 "transaction_type": "sales",
                 "quantity": item["quantity"],
-                "price": get_unit_price(item["item_name"]) * item["quantity"],
+                "price": item["total_price"],
                 "date": request["request_date"]
             }
             if item["current_stock"] == -1:
                 transaction_item["quantity"] = 0
             # Sales transaction
+            print("================== # Sales transaction")
+
             transaction_id = self.inventory_agent.run(PROCESS_TRANSACTION_PROMPT.format(transaction_item=transaction_item))
             print(f"transaction_id: {transaction_id}")
-            item = self.get_item_inventory(format_string, item, request)
+            print("================== # Get item inventory for buy stock")
+
+            item = self.get_item_inventory(format_string, item, request, available_inventory)
             if item["current_stock"] < item["min_stock_level"]:
+                print("================== # Cash balance")
+
+                cash_balance = self.inventory_agent.run(CASH_BALANCE_PROMPT.format(as_of_date=request["request_date"]))
+                cash_balance = float(cash_balance)
                 order_quantity = item["min_stock_level"] * 2 - item["current_stock"]
-                order_transaction_item = {
-                    "item_name": item["item_name"],
-                    "transaction_type": "stock_orders",
-                    "quantity": order_quantity,
-                    "price": get_unit_price(item["item_name"]) * order_quantity,
-                    "date": request["request_date"]
-                }
-                # Order stock transaction
-                order_transaction_id = self.inventory_agent.run(PROCESS_TRANSACTION_PROMPT.format(transaction_item=order_transaction_item))
-                print(f"order_transaction_id: {order_transaction_id}")
+                price = item["unit_price"] * order_quantity
+                if cash_balance > price:
+                    order_transaction_item = {
+                        "item_name": item["item_name"],
+                        "transaction_type": "stock_orders",
+                        "quantity": order_quantity,
+                        "price": price,
+                        "date": request["request_date"]
+                    }
+                    # Order stock transaction
+                    print("================== # Order stock transaction")
+
+                    order_transaction_id = self.inventory_agent.run(PROCESS_TRANSACTION_PROMPT.format(transaction_item=order_transaction_item))
+                    print(f"order_transaction_id: {order_transaction_id}")
 
 
         # Sales transaction
         # Update stock
         # Check stock
         ## stock_orders for items with quantity < min stock
-
         return response
 
-    def get_item_inventory(self, format_string, item, request):
+    def get_item_inventory(self, format_string, item, request, available_inventory):
 
 
-        item_data = self.inventory_agent.run(CHECK_INVENTORY_PROMPT.format(item_name=item["item_name"],
-                                                                                delivery_deadline=request[
-                                                                                    "delivery_deadline"]))
-        supplier_delivery_date_str = get_supplier_delivery_date(request["request_date"], item["quantity"])
-        supplier_delivery_date = datetime.strptime(supplier_delivery_date_str, format_string)
+        item_data = self.inventory_agent.run(
+            CHECK_INVENTORY_PROMPT.format(
+                item_name=item["item_name"],
+                delivery_deadline=request["delivery_deadline"],
+                available_inventory=available_inventory,
+                request_date=request["request_date"],
+                quantity=item["quantity"]
+            )
+        )
         item["current_stock"] = item_data["current_stock"]
         item["min_stock_level"] = item_data["min_stock_level"]
-        item["supplier_delivery_date"] = supplier_delivery_date
-        print(f"item: {item}")
-
+        if item_data["supplier_delivery_date"] is not None:
+            item["supplier_delivery_date"] = datetime.strptime(item_data["supplier_delivery_date"], format_string)
         return item
 
-    def structure_quote_request(self, request, request_date):
-        structure_prompt = STRUCTURE_REQUEST_PROMPT_TEMPLATE.format(request_date=request_date,
-                                                                    request_text=request)
-        result = self.quote_agent.run(structure_prompt)
-        result_str = str(result)
-        structured_request_data = ast.literal_eval(result_str)
-        total_amount = 0.0
-        for item in structured_request_data['items']:
-            item_name = item['item_name']
-            item['unit_price'] = get_unit_price(item_name)
-            item['total_price'] = item['unit_price'] * item['quantity']
-            total_amount += item['total_price']
-        structured_request_data['total_amount'] = round(total_amount, 2)
-        return structured_request_data
+    def structure_quote_request(self, request, request_date, available_inventory):
+        structure_prompt = STRUCTURE_REQUEST_PROMPT_TEMPLATE.format(
+            request_date=request_date,
+            request_text=request,
+            available_inventory=available_inventory
+        )
+
+        attempts = 0
+        max_retries = 5
+        last_error = ""
+
+        while attempts < max_retries:
+            try:
+                # If it's a retry, append a correction hint to the prompt
+                current_prompt = structure_prompt
+                if attempts > 0:
+                    current_prompt += f"\n\n**CRITICAL ERROR:** Your previous response was not a valid Python dictionary. Error: {last_error}. RE-TRY: Return ONLY the raw dictionary."
+
+                result = self.quote_agent.run(current_prompt)
+                result_str = str(result)
+
+                # Attempt to evaluate the string into a dictionary
+                structured_request_data = ast.literal_eval(result_str)
+
+                # Logic for calculating prices (same as your original)
+                total_amount = 0.0
+                for item in structured_request_data['items']:
+                    item_name = item['item_name']
+                    item['unit_price'] = get_unit_price(item_name)
+                    item['total_price'] = item['unit_price'] * item['quantity']
+                    total_amount += item['total_price']
+
+                structured_request_data['total_amount'] = round(total_amount, 2)
+
+                # Successfully parsed and enriched, return the data
+                return structured_request_data
+
+            except (ValueError, SyntaxError, TypeError) as e:
+                attempts += 1
+                last_error = str(e)
+                print(f"Attempt {attempts} failed: {last_error}. Retrying...")
+                time.sleep(1)  # Brief pause to allow API rate limits / consistency
+
+        print("Max retries reached. Agent failed to return a structured dictionary.")
+        return None
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
