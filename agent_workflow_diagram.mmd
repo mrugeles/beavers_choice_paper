@@ -27,6 +27,13 @@ flowchart TB
         create_transaction(["create_transaction"])
 
   end
+   subgraph AccountScope["Account Agent Scope"]
+        AccountAgent["<b>AccountAgent</b><br>Responsibility: Handles financial reporting. "]
+        ToolFinancialReport("<b>Tool: get_financial_report</b><br><b>Purpose:</b> Generate a complete financial report for the company as of a specific date.<br><b>Input:</b> as_of_date [str]<br><b>Output:</b> JSON Dict [financial report]")
+        generate_financial_report(["generate_financial_report"])
+
+
+  end
     UserRequest(["User Request: Raw Text + Date"]) --> Orch
     ToolStructureRequest --> LLMCall
     ToolStructureRequest --Parsing fail---> ToolStructureRequestError1
@@ -59,6 +66,11 @@ flowchart TB
     ToolOrderItemStock -- Insert Stock Order --- DB
     ToolOrderItemStock -. Transaction ID .-> InventoryAgent
     InventoryAgent -- Confirm Success --> Orch
+    Orch -- "6. Generate Financial Report" --> AccountAgent
+    AccountAgent -. Request Date.-> ToolFinancialReport
+    ToolFinancialReport --Transaction Object---> generate_financial_report
+    ToolFinancialReport -. Financial Report.-> AccountAgent
+    generate_financial_report -- Retrive Financial Report --- DB
     Orch --> FinalResponse(["Return Final Quote to User"])
 
 
@@ -70,4 +82,6 @@ flowchart TB
      InventoryAgent:::agent
      ToolCheckItemStock:::tool
      ToolOrderItemStock:::tool
+     AccountAgent:::agent
+     ToolFinancialReport:::tool
      DB:::db
