@@ -683,7 +683,6 @@ def check_item_stock(
     if item_name in available_inventory:
         result = get_stock_level(item_name, as_of_date)
         if result["item_name"].iloc[0] is None:
-            print(f"DEBUG: item {item_name} not available in DB inventory as of {as_of_date}")
             return {"item_name": item_name, "current_stock": -1, "unit_price": -1, "min_stock_level": -1, "supplier_delivery_date": None}
         stock = int(result["current_stock"].iloc[0])
         unit_price = float(result["unit_price"].iloc[0])
@@ -692,7 +691,6 @@ def check_item_stock(
         item = {"item_name": item_name, "current_stock": stock, "unit_price": unit_price, "min_stock_level": min_stock_level, "supplier_delivery_date": supplier_delivery_date}
         return item
     else:
-        print(f"DEBUG: item {item_name} not available in inventory as of {as_of_date}")
         item = {"item_name": item_name, "current_stock": -1, "unit_price": -1, "min_stock_level": -1, "supplier_delivery_date": None}
         return item
 
@@ -962,7 +960,6 @@ def structure_request(request_text: str, request_date: str, available_inventory:
         cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
         return json.loads(cleaned_response)
     except json.JSONDecodeError:
-        print("Error: The model did not return valid JSON.")
         return {"error": "The model did not return valid JSON."}
 
 @tool
@@ -1027,7 +1024,6 @@ def calculate_quote(structured_request:str, historical_quotes: str) -> Dict:
         cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
         return json.loads(cleaned_response)
     except json.JSONDecodeError:
-        print("Error: The model did not return valid JSON.")
         return {"error": "The model did not return valid JSON."}
 
 class QuoteAgent(ToolCallingAgent):
@@ -1041,8 +1037,57 @@ class QuoteAgent(ToolCallingAgent):
             description="Agent for generating quotes based on client requests.",
         )
 
-# Tools for ordering agent
+# Tools for accounting agent
+@tool
+def get_financial_report(as_of_date: Union[str, datetime]) -> Dict:
+    """
+        Generate a complete financial report for the company as of a specific date.
 
+        This includes:
+        - Cash balance
+        - Inventory valuation
+        - Combined asset total
+        - Itemized inventory breakdown
+        - Top 5 best-selling products
+
+        Args:
+            as_of_date (str or datetime): The date (inclusive) for which to generate the report.
+
+        Returns:
+            Dict: A dictionary containing the financial report fields:
+                - 'as_of_date': The date of the report
+                - 'cash_balance': Total cash available
+                - 'inventory_value': Total value of inventory
+                - 'total_assets': Combined cash and inventory value
+                - 'inventory_summary': List of items with stock and valuation details
+                - 'top_selling_products': List of top 5 products by revenue
+        """
+    return generate_financial_report(as_of_date)
+
+FINANCIAL_REPORT_PROMPT = """
+Generate a concise financial summary as of {as_of_date}.
+
+### OUTPUT INSTRUCTIONS:
+1. Return ONLY a valid JSON object. 
+2. Do not include any conversational text or markdown headers.
+3. Use standard floats (e.g., 1250.50). 
+
+### EXPECTED JSON FORMAT:
+{{
+    "cash_balance": 0.0,
+    "inventory_value": 0.0
+}}
+"""
+class AccountAgent(ToolCallingAgent):
+    """Agent for generating quotes."""
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            tools=[get_financial_report],
+            model=model,
+            name="account_agent",
+            description="Handles financial reporting. Use to get cash balances, inventory valuation, and asset summaries.",
+        )
 
 # Set up your agents and create an orchestration agent that will manage them.
 def get_unit_price(item_name: str) -> float:
@@ -1071,26 +1116,27 @@ class OrchestratorAgent(ToolCallingAgent):
         )
         self.quote_agent = QuoteAgent(model=model)
         self.inventory_agent = InventoryAgent(model=model)
+        self.account_agent = AccountAgent(model=model)
+
+    def financial_report(self, as_of_date: str):
+        raw_response = self.account_agent.run(FINANCIAL_REPORT_PROMPT.format(as_of_date=as_of_date))
+        return parse_inventory_json(raw_response)
 
     def process_quote_request(self, request: str, request_date: str) -> str:
         response = ""
         format_string = "%Y-%m-%d"
         # Step 1: Structure the request
-        print("================== Get available inventory")
         available_inventory = self.inventory_agent.run(f"Get the list of all item names currently in stock as of date {request_date}.")
-        print("================== Structure request")
         request = self.structure_quote_request(request, request_date, available_inventory)
         if request is None:
             return "Could not process quote due to agent error."
         # Check stock
         for item in request["items"]:
             delivery_deadline = datetime.strptime(request["delivery_deadline"], format_string)
-            print("================== get_item_inventory")
             item = self.get_item_inventory(format_string, item, request, available_inventory)
             if item["current_stock"] == -1:
                 return "Could not process quote due to insufficient stock."
             if (item["current_stock"] < item["quantity"]) and (item["supplier_delivery_date"] > delivery_deadline):
-                print("Could not process quote due to insufficient stock.")
                 return "Could not process quote due to insufficient stock."
             item["supplier_delivery_date"] = item["supplier_delivery_date"].strftime(format_string)
 
@@ -1098,16 +1144,13 @@ class OrchestratorAgent(ToolCallingAgent):
         ## Get the historical quotes (this will be a JSON string)
         items = [item['item_name'] for item in request.get('items', [])]
         items = ','.join(items)
-        print("================== Get quote history")
         historical_quotes_data_str = self.quote_agent.run(QUOTE_HISTORY_PROMPT.format(items=items))
         structured_request_data_str = json.dumps(request)
         # The agent will now infer the 'calculate_quote' tool and return raw JSON
-        print("================== Calculate quote")
         final_result = self.quote_agent.run(QUOTE_REQUEST_PROMPT.format(
             structured_request_data=structured_request_data_str,
             historical_quotes_data=historical_quotes_data_str
         ))
-        print("================== Processing quote")
 
         final_result = str(final_result)
         final_result = ast.literal_eval(final_result)
@@ -1124,15 +1167,11 @@ class OrchestratorAgent(ToolCallingAgent):
             if item["current_stock"] == -1:
                 transaction_item["quantity"] = 0
             # Sales transaction
-            print("================== # Sales transaction")
 
             transaction_id = self.inventory_agent.run(PROCESS_TRANSACTION_PROMPT.format(transaction_item=transaction_item))
-            print(f"transaction_id: {transaction_id}")
-            print("================== # Get item inventory for buy stock")
 
             item = self.get_item_inventory(format_string, item, request, available_inventory)
             if item["current_stock"] < item["min_stock_level"]:
-                print("================== # Cash balance")
 
                 cash_balance = self.inventory_agent.run(CASH_BALANCE_PROMPT.format(as_of_date=request["request_date"]))
                 cash_balance = float(cash_balance)
@@ -1147,10 +1186,8 @@ class OrchestratorAgent(ToolCallingAgent):
                         "date": request["request_date"]
                     }
                     # Order stock transaction
-                    print("================== # Order stock transaction")
 
                     order_transaction_id = self.inventory_agent.run(PROCESS_TRANSACTION_PROMPT.format(transaction_item=order_transaction_item))
-                    print(f"order_transaction_id: {order_transaction_id}")
 
 
         # Sales transaction
@@ -1226,14 +1263,76 @@ class OrchestratorAgent(ToolCallingAgent):
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
-def call_multi_agent_system(row):
+def call_multi_agent_system(row, orchestrator_agent):
     response = None
     format_string = "%Y-%m-%d"
-    orchestrator_agent = OrchestratorAgent(model=model)
 
     response = orchestrator_agent.process_quote_request(row["request"], row["request_date"].strftime(format_string))
     return response
 
+
+import json
+import re
+
+
+def parse_inventory_json(text):
+    # If it's already a dict, just return it
+    if isinstance(text, dict):
+        return text
+
+    # If it's not a string at this point, we can't parse it
+    if not isinstance(text, str):
+        return {"cash_balance": 0.0, "inventory_value": 0.0, "error": "Input was not string"}
+
+    # 1. Clean formatting artifacts and invisible spaces
+    # This removes the vertical bars '|' and non-breaking spaces '\xa0'
+    text = text.replace('|', '').replace('\xa0', ' ')
+
+    # 2. Extract the JSON block
+    # This prevents issues if the LLM added "report: " or other text prefixes
+    start_idx = text.find('{')
+    end_idx = text.rfind('}')
+    if start_idx != -1 and end_idx != -1:
+        text = text[start_idx:end_idx + 1]
+
+    # 3. FIX THE "NP.FLOAT64" ISSUE
+    # This regex looks for 'np.float64(NUMBER)' or 'np.int64(NUMBER)'
+    # and replaces it with just 'NUMBER'
+    text = re.sub(r'np\.\w+\(([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\)', r'\1', text)
+
+    # 4. FIX THE "NAN" ISSUE
+    # Standard JSON uses 'null', not 'nan'
+    text = re.sub(r'\bnan\b', 'null', text, flags=re.IGNORECASE)
+
+    # 5. FIX LEADING ZEROS
+    # Removes illegal leading zeros (e.g., 08 -> 8) but keeps 0.08
+    text = re.sub(r'\b0+(?=[1-9])', '', text)
+
+    try:
+        # Attempt standard JSON loading
+        data = json.loads(text)
+
+        # Unwrap smolagents 'answer' key if it exists
+        if isinstance(data, dict) and "answer" in data:
+            # If the answer is already a dict, return it; otherwise, parse it
+            if isinstance(data["answer"], dict):
+                return data["answer"]
+            return parse_inventory_json(data["answer"])
+
+        return data
+    except json.JSONDecodeError:
+        # Fallback: if the LLM used single quotes instead of double quotes,
+        # we try ast.literal_eval but replace 'null' with 'None' first.
+        import ast
+        try:
+            python_friendly_text = text.replace('null', 'None')
+            return ast.literal_eval(python_friendly_text)
+        except Exception as e:
+            return f"Failed to parse even with fallback: {e}"
+
+
+# Usage
+# result = parse_inventory_json(your_raw_string)
 
 def run_test_scenarios():
 
@@ -1290,11 +1389,11 @@ def run_test_scenarios():
         ############
         ############
         ############
+        orchestrator_agent = OrchestratorAgent(model=model)
 
-        response = call_multi_agent_system(row)
-        #response = None
+        response = call_multi_agent_system(row, orchestrator_agent)
         # Update state
-        report = generate_financial_report(request_date)
+        report = orchestrator_agent.financial_report(request_date)
         current_cash = report["cash_balance"]
         current_inventory = report["inventory_value"]
 
@@ -1317,6 +1416,7 @@ def run_test_scenarios():
     # Final report
     final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
     final_report = generate_financial_report(final_date)
+
     print("\n===== FINAL FINANCIAL REPORT =====")
     print(f"Final Cash: ${final_report['cash_balance']:.2f}")
     print(f"Final Inventory: ${final_report['inventory_value']:.2f}")
